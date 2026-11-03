@@ -1,0 +1,39 @@
+# Python
+backend/venv/
+backend/__pycache__/
+backend/**/__pycache__/
+backend/**/*.pyc
+backend/**/*.pyo
+*.pyc
+*.pyo
+__pycache__/
+
+# Environment
+backend/.env
+frontend/.env
+.env
+
+# Database
+backend/portfolio.db
+backend/*.db
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.cache/
+
+# Editor
+.vscode/
+.idea/
+*.suo
+*.swp
+*.sln
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+logs/
