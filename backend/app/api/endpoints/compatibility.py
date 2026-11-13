@@ -1,4 +1,8 @@
-"""Vibe Check / Tech Stack Compatibility endpoints (MANDATORY)."""
+"""Vibe Check / Tech Stack Compatibility endpoints (MANDATORY).
+
+Auto-syncs the GitHub profile if not cached yet, so the user
+never has to manually sync before running a Vibe Check.
+"""
 
 import logging
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -7,23 +11,33 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models.models import CompatibilityAnalysis, User
 from app.schemas.schemas import CompatibilityRequest, CompatibilityResponse
+from app.services.cache_service import sync_profile
 from app.services.compatibility_service import analyze_compatibility
 
 router = APIRouter(prefix="/compatibility", tags=["Vibe Check"])
 logger = logging.getLogger(__name__)
 
 
-def _get_user_or_404(username: str, db: Session) -> User:
+async def _get_or_sync_user(username: str, db: Session) -> User:
+    """Return cached user, auto-syncing from GitHub if not found yet."""
     user = db.query(User).filter(User.github_username == username).first()
-    if not user:
+    if user:
+        return user
+
+    # Not in cache — fetch from GitHub transparently
+    try:
+        user, _ = await sync_profile(db, username, force_refresh=False)
+        return user
+    except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail={
-                "code": "USER_NOT_FOUND",
-                "message": f"No cached profile for '{username}'. Please sync your GitHub profile first.",
-            },
+            detail={"code": "GITHUB_USER_NOT_FOUND", "message": str(exc)},
         )
-    return user
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "GITHUB_UNAVAILABLE", "message": str(exc)},
+        )
 
 
 def _analysis_to_response(analysis: CompatibilityAnalysis, username: str) -> CompatibilityResponse:
@@ -37,9 +51,9 @@ def _analysis_to_response(analysis: CompatibilityAnalysis, username: str) -> Com
         unassessed_keywords=analysis.unassessed_keywords or [],
         score_basis=analysis.score_basis,
         message=(
-            "GitHub evidence-based compatibility estimate."
+            "Match based on primary languages in your cached GitHub repositories."
             if analysis.match_percentage is not None
-            else "No recognized programming-language requirements were found in the job description."
+            else "No recognized programming languages were found in the job description."
         ),
     )
 
@@ -47,11 +61,9 @@ def _analysis_to_response(analysis: CompatibilityAnalysis, username: str) -> Com
 @router.post("/analyze", response_model=CompatibilityResponse, status_code=status.HTTP_201_CREATED)
 async def analyze(request: CompatibilityRequest, db: Session = Depends(get_db)):
     """
-    Vibe Check: extract programming languages from a job description
-    and compare them against the user's cached repository languages.
-    Returns a match percentage badge and breakdown.
+    Vibe Check — auto-syncs profile if needed, then runs compatibility analysis.
     """
-    user = _get_user_or_404(request.username, db)
+    user = await _get_or_sync_user(request.username, db)
     try:
         analysis = analyze_compatibility(db, user, request.job_description)
         return _analysis_to_response(analysis, user.github_username)

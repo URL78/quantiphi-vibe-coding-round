@@ -1,203 +1,185 @@
 """
-Vibe Check / Tech Stack Compatibility Service (MANDATORY FEATURE).
+Vibe Check – Tech Stack Compatibility Service (MANDATORY FEATURE).
 
-Algorithm:
-  1. Extract recognized programming languages from the job description
-     using a predefined alias dictionary and word-boundary regex.
-  2. Normalize all aliases to canonical language names.
-  3. Read the distinct primary languages from the user's cached repositories in SQLite.
-  4. Compare the two sets.
-  5. Calculate: match_percentage = matched / required * 100
-  6. Persist the analysis in compatibility_analyses table.
+Algorithm
+─────────
+1. Lowercase the entire job description.
+2. For each known language, check if any of its aliases appear in the text.
+3. Build the set of "recognized required languages" from the JD.
+4. Load the user's distinct cached repository primary languages from SQLite.
+5. Intersect the two sets → matched / unmatched.
+6. match_percentage = len(matched) / len(required) × 100
+   (null when required set is empty — avoids division by zero)
+7. Persist result in compatibility_analyses table.
 
-Edge cases handled:
-  - No recognized languages  → match_percentage = null, clear message
-  - No cached repositories   → clear error prompting sync
-  - No matching languages    → score of 0 (not null)
-  - Duplicate / alias names  → deduplicated to canonical before comparison
-  - Substring traps          → word-boundary regex prevents false matches
-  - Case insensitivity       → all matching is lowercased
+Key design decisions
+────────────────────
+- Each alias in LANGUAGE_DEFINITIONS is a plain lowercase string.
+  Pattern building happens here, with special handling for:
+    - Languages ending in non-word chars (C++, C#, F#) → custom boundary
+    - JavaScript-before-Java disambiguation (strip JS before checking Java)
+    - 'go' alone is too ambiguous → only match 'golang'/'go language'
+- Frameworks / tools go to unassessed_keywords, not the language score.
 """
 
 import logging
 import re
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Set, Tuple
 
 from sqlalchemy.orm import Session
 
 from app.models.models import CompatibilityAnalysis, Repository, User
 from app.utils.helpers import utcnow
-from app.utils.language_dict import (
-    LANGUAGE_DEFINITIONS,
-    NON_LANGUAGE_KEYWORDS,
-)
+from app.utils.language_dict import LANGUAGE_DEFINITIONS, NON_LANGUAGE_KEYWORDS
 
 logger = logging.getLogger(__name__)
 
 
-# ─── Language extraction ─────────────────────────────────────────────────
+# ─── Pattern compilation ──────────────────────────────────────────────────────
 
-
-def _build_patterns() -> List[Tuple[str, List[re.Pattern]]]:
+def _make_pattern(alias: str) -> re.Pattern:
     """
-    Compile regex patterns for each language once at module load time.
-    Returns list of (canonical_name, [compiled patterns]) ordered as defined.
+    Build a safe, word-boundary-aware pattern for a plain alias string.
+
+    For aliases ending in a non-word character (like '+' in 'c++' or '#' in 'c#'),
+    standard \b doesn't work. We use a negative lookahead/lookbehind instead.
     """
-    compiled: List[Tuple[str, List[re.Pattern]]] = []
-    for canonical, aliases in LANGUAGE_DEFINITIONS:
-        patterns = []
-        for alias in aliases:
-            # Aliases may already contain regex like \b or (?!...)
-            # Wrap in word-boundary only if alias does NOT already start with \b or (?
-            if alias.startswith("\\b") or alias.startswith("(?"):
-                pattern_str = alias
-            else:
-                pattern_str = r"\b" + re.escape(alias) + r"\b"
-            try:
-                patterns.append(re.compile(pattern_str, re.IGNORECASE))
-            except re.error as e:
-                logger.warning("Invalid regex for '%s' alias '%s': %s", canonical, alias, e)
-        compiled.append((canonical, patterns))
-    return compiled
+    # Escape the alias so it matches literally
+    escaped = re.escape(alias)
+
+    # Determine if the alias starts/ends with word chars
+    starts_word = bool(re.match(r'\w', alias[0]))
+    ends_word   = bool(re.match(r'\w', alias[-1]))
+
+    prefix = r'\b'   if starts_word else r'(?<!\w)'
+    suffix = r'\b'   if ends_word   else r'(?!\w)'
+
+    return re.compile(prefix + escaped + suffix, re.IGNORECASE)
 
 
-_COMPILED_PATTERNS = _build_patterns()
+# Build once at module load — (canonical_name, [compiled_patterns])
+_LANG_PATTERNS: List[Tuple[str, List[re.Pattern]]] = [
+    (canonical, [_make_pattern(a) for a in aliases])
+    for canonical, aliases in LANGUAGE_DEFINITIONS
+]
 
-# Non-language keyword patterns (for unassessed_keywords)
-_NON_LANG_PATTERNS = [
-    (kw, re.compile(r"\b" + re.escape(kw) + r"\b", re.IGNORECASE))
-    for kw in NON_LANGUAGE_KEYWORDS
+_NON_LANG_PATTERNS: List[Tuple[str, re.Pattern]] = [
+    (kw, _make_pattern(kw)) for kw in NON_LANGUAGE_KEYWORDS
 ]
 
 
-def extract_languages_from_jd(
-    job_description: str,
-) -> Tuple[List[str], List[str]]:
-    """
-    Extract recognized programming languages and unassessed tech keywords.
+# ─── Language extraction ──────────────────────────────────────────────────────
 
-    Returns:
-        (recognized_programming_languages, unassessed_keywords)
-    Both lists contain deduplicated, canonical-name values.
+def extract_languages_from_jd(jd: str) -> Tuple[List[str], List[str]]:
     """
+    Return (recognized_languages, unassessed_tech_keywords).
+    """
+    # Strip 'javascript' occurrences before checking for plain 'java'
+    jd_no_js = re.sub(r'\bjavascript\b', '', jd, flags=re.IGNORECASE)
+    # Strip 'typescript' before checking for plain 'type' (edge case)
+    jd_no_ts = re.sub(r'\btypescript\b', '', jd, flags=re.IGNORECASE)
+
     recognized: Set[str] = set()
     unassessed: Set[str] = set()
 
-    # Match languages (ordered: most specific alias first)
-    for canonical, patterns in _COMPILED_PATTERNS:
-        for pattern in patterns:
-            if pattern.search(job_description):
+    for canonical, patterns in _LANG_PATTERNS:
+        # Use de-polluted text only for the ambiguous languages
+        search_text = jd_no_js if canonical == "Java" else jd
+        for pat in patterns:
+            if pat.search(search_text):
                 recognized.add(canonical)
-                break  # canonical already matched, move to next language
+                break
 
-    # Match non-language keywords
-    for keyword, pattern in _NON_LANG_PATTERNS:
-        if pattern.search(job_description):
-            unassessed.add(keyword)
+    for kw, pat in _NON_LANG_PATTERNS:
+        if pat.search(jd):
+            unassessed.add(kw)
 
-    # Remove any canonical language name that may also appear in unassessed
-    # (frameworks named after languages, e.g. "Go" vs "golang")
-    unassessed -= recognized
+    # Prevent language names from leaking into unassessed
+    recognized_lower = {l.lower() for l in recognized}
+    unassessed = {u for u in unassessed if u.lower() not in recognized_lower}
 
     return sorted(recognized), sorted(unassessed)
 
 
-# ─── Repository language retrieval ───────────────────────────────────────
-
+# ─── Repository language retrieval ───────────────────────────────────────────
 
 def get_repo_languages(db: Session, user: User) -> Set[str]:
-    """
-    Return the set of distinct, lowercased primary languages
-    from the user's cached repositories (excluding None/empty).
-    """
-    repos = (
+    """Return distinct lowercase primary languages from cached repositories."""
+    rows = (
         db.query(Repository.language)
         .filter(Repository.user_id == user.id, Repository.language.isnot(None))
         .all()
     )
-    return {row.language.strip().lower() for row in repos if row.language and row.language.strip()}
+    return {r.language.strip().lower() for r in rows if r.language and r.language.strip()}
 
 
-# ─── Match calculation ───────────────────────────────────────────────────
-
+# ─── Match calculation ────────────────────────────────────────────────────────
 
 def calculate_match(
     recognized_languages: List[str],
     repo_languages: Set[str],
 ) -> Dict[str, Any]:
     """
-    Compare required languages against cached repo languages.
-    Returns match stats dict.
+    Compare required languages (from JD) against cached repo languages.
+    Formula:  match_percentage = len(matched) / len(required) × 100
     """
     if not recognized_languages:
         return {
             "match_percentage": None,
             "matched_languages": [],
             "unmatched_languages": [],
-            "message": "No recognized programming-language requirements were found in the job description.",
+            "message": (
+                "No recognized programming languages were found in the job description. "
+                "Try including specific language names (Python, Java, Go…)."
+            ),
         }
 
-    matched: List[str] = []
-    unmatched: List[str] = []
-
+    matched, unmatched = [], []
     for lang in recognized_languages:
         if lang.lower() in repo_languages:
             matched.append(lang)
         else:
             unmatched.append(lang)
 
-    match_pct = round((len(matched) / len(recognized_languages)) * 100, 2)
-
+    pct = round(len(matched) / len(recognized_languages) * 100, 2)
     return {
-        "match_percentage": match_pct,
+        "match_percentage": pct,
         "matched_languages": matched,
         "unmatched_languages": unmatched,
-        "message": "GitHub evidence-based compatibility estimate.",
+        "message": "Match based on primary languages in cached repositories.",
     }
 
 
-# ─── Full Vibe Check analysis ─────────────────────────────────────────────
-
+# ─── Full Vibe Check pipeline ─────────────────────────────────────────────────
 
 def analyze_compatibility(
     db: Session,
     user: User,
     job_description: str,
 ) -> CompatibilityAnalysis:
-    """
-    Full Vibe Check pipeline:
-      extract → compare → calculate → persist → return.
-    """
-    # Check for cached repos
-    repo_count = db.query(Repository).filter(Repository.user_id == user.id).count()
-    if repo_count == 0:
+    """Full Vibe Check: extract → compare → persist → return."""
+    if db.query(Repository).filter(Repository.user_id == user.id).count() == 0:
         raise ValueError(
-            "No cached repositories found. Please sync your GitHub profile first."
+            "No cached repositories found for this user. "
+            "Please sync the GitHub profile first."
         )
 
-    # Extract languages from job description
-    recognized_langs, unassessed_kws = extract_languages_from_jd(job_description)
+    recognized, unassessed = extract_languages_from_jd(job_description)
+    repo_langs = get_repo_languages(db, user)
+    result = calculate_match(recognized, repo_langs)
 
-    # Get user's repo languages from SQLite (no GitHub call needed)
-    repo_languages = get_repo_languages(db, user)
-
-    # Calculate match
-    match_result = calculate_match(recognized_langs, repo_languages)
-
-    # Persist analysis
     analysis = CompatibilityAnalysis(
         user_id=user.id,
         job_description=job_description,
-        match_percentage=match_result["match_percentage"],
-        recognized_required_languages=recognized_langs,
-        matched_languages=match_result["matched_languages"],
-        unmatched_languages=match_result["unmatched_languages"],
-        unassessed_keywords=unassessed_kws,
+        match_percentage=result["match_percentage"],
+        recognized_required_languages=recognized,
+        matched_languages=result["matched_languages"],
+        unmatched_languages=result["unmatched_languages"],
+        unassessed_keywords=list(unassessed),
         score_basis="distinct_primary_languages_in_cached_repositories",
         analyzed_at=utcnow(),
     )
     db.add(analysis)
     db.commit()
     db.refresh(analysis)
-
     return analysis
